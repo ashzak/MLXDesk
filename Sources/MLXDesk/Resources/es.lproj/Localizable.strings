@@ -1,0 +1,6 @@
+"app.name" = "MLX Desk";
+"model.load" = "Cargar e iniciar";
+"model.cancel" = "Cancelar carga";
+"diagnostics.title" = "Diagnóstico de MLX Desk";
+"storage.title" = "Almacenamiento de modelos";
+"onboarding.title" = "IA privada, adaptada a este Mac";
