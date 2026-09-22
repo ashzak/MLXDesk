@@ -185,10 +185,42 @@ struct MessageContentText: View {
     /// leave the ``` fences showing as literal text).
     private enum Segment { case text(String), code(language: String?, code: String) }
 
+    /// Parsing content into segments (fence-splitting) and, per text segment,
+    /// into an `AttributedString` (full CommonMark-ish Markdown) is real work --
+    /// and `body` runs far more often than once per visible change: SwiftUI
+    /// proposes multiple candidate sizes while laying out a flexible-width
+    /// ScrollView, and any change to an `@Observable` property an ancestor view
+    /// reads (e.g. `isGenerating` toggling on every send) can trigger a fresh
+    /// body evaluation across the whole message list. Redoing both parses for
+    /// every message in a real conversation (76 messages, several with large
+    /// code blocks) on every such pass reproduced a genuine multi-minute SwiftUI
+    /// layout hang -- confirmed live via `sample`: pegged inside the
+    /// AttributeGraph/layout engine, not actually deadlocked, just repeating
+    /// this work forever. Caching both by the exact content string sidesteps
+    /// that regardless of how many times SwiftUI calls in: a still-streaming
+    /// message's content changes on every token and so naturally invalidates
+    /// its own entry, while every complete, unchanging message reuses its
+    /// parse instantly. NSCache (not a plain dictionary) evicts under memory
+    /// pressure, so a very long session doesn't grow this unboundedly.
+    private static let segmentCache = NSCache<NSString, SegmentBox>()
+    private final class SegmentBox { let segments: [Segment]; init(_ segments: [Segment]) { self.segments = segments } }
+    private static let attributedCache = NSCache<NSString, AttributedBox>()
+    private final class AttributedBox { let value: AttributedString?; init(_ value: AttributedString?) { self.value = value } }
+
+    private static func attributedString(for text: String) -> AttributedString? {
+        let key = text as NSString
+        if let cached = attributedCache.object(forKey: key) { return cached.value }
+        let value = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .full))
+        attributedCache.setObject(AttributedBox(value), forKey: key)
+        return value
+    }
+
     /// Splits on ``` fences. A fence left open at the end of `content` (the
     /// model is still streaming inside it) is still treated as code, not left
     /// as a dangling literal fence marker in the prose.
     private static func segments(of content: String) -> [Segment] {
+        let cacheKey = content as NSString
+        if let cached = segmentCache.object(forKey: cacheKey) { return cached.segments }
         var result: [Segment] = []
         var textLines: [String] = []
         func flushText() {
@@ -215,6 +247,7 @@ struct MessageContentText: View {
             }
         }
         flushText()
+        segmentCache.setObject(SegmentBox(result), forKey: cacheKey)
         return result
     }
 
@@ -223,7 +256,7 @@ struct MessageContentText: View {
             ForEach(Array(Self.segments(of: content).enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .text(let text):
-                    if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .full)) {
+                    if let attributed = Self.attributedString(for: text) {
                         Text(attributed)
                     } else {
                         Text(text)
