@@ -10,6 +10,19 @@ private final class NativeSessionBox: @unchecked Sendable {
     init(_ session: ChatSession) { self.session = session }
 }
 
+/// Holds the latest `fractionCompleted` reported by swift-huggingface's download
+/// `Progress`, read from a `@Sendable` callback that can fire on any thread. A plain
+/// actor rather than passing `Progress` itself across the boundary -- `Progress` is a
+/// mutable reference type with no Sendable guarantee, whereas the `Double` snapshot
+/// taken inside the callback is safe to hand off.
+private actor DownloadProgressBox {
+    private(set) var fractionCompleted: Double?
+    func update(_ progress: Progress) {
+        let fraction = progress.fractionCompleted
+        if fraction.isFinite { fractionCompleted = fraction }
+    }
+}
+
 
 actor MLXService {
     enum InjectedFault: Sendable { case startFailure, streamFailure, streamStall }
@@ -133,45 +146,64 @@ actor MLXService {
         if usesNativeRuntime {
             await progress(.init(phase: .launching, detail: "Preparing the native MLX engine"))
             let configuration = ModelConfiguration(id: model.repository)
-            // swift-huggingface's own progress callback (wired below via the explicit
-            // `progressHandler:` label -- a trailing closure there gets silently dropped, see
-            // the note above the call) fires reliably and DOES track small metadata files
-            // correctly, confirmed by direct instrumentation: completedUnitCount climbed
-            // 0 -> 136K -> 6.8M -> 26.8M within the first second. But the moment the large,
-            // multi-GB weight shards start downloading concurrently, it freezes there
-            // permanently -- reported progress sat pinned at exactly 26,849,995 bytes for the
-            // rest of the transfer while hundreds of MB/s of real weight data kept landing on
-            // disk (watched directly via the temp files those downloads write to). That's a
-            // concurrency bug in how the library wires each concurrent download's child
-            // Progress into the parent under its task-group downloader, not something fixable
-            // from here short of patching that dependency. So: don't trust it. Poll the same
-            // ground truth the (already working, in daily use) legacy server path relies on --
-            // actual bytes moved into the Hugging Face cache's blobs directory, via this
-            // actor's own cachedBytes(for:)/downloadPercent(for:).
-            let downloadPollTask = Task.detached { [weak self] in
-                var lastReportedPercent = -1
+            // An earlier version of this method polled the Hugging Face cache's blobs
+            // directory instead of trusting swift-huggingface's own Progress (see below for
+            // why that callback was distrusted). That polling approach is fundamentally
+            // blind for the large weight shard(s): URLSession's download(for:delegate:)
+            // buffers each transfer to a private system temp file and only moves it into
+            // the visible cache directory once the WHOLE download finishes, so the reported
+            // percent sat at 0% for the entire multi-GB transfer -- confirmed live by
+            // watching both the cache directory (flat) and the actual growing
+            // CFNetworkDownload_*.tmp temp file (climbing in lockstep with real network
+            // throughput) side by side during a fresh download.
+            //
+            // The Progress callback itself was previously found to freeze partway through
+            // large concurrent downloads (reported progress pinned at a fixed byte count
+            // while real data kept arriving) -- a suspected upstream bug in how the
+            // library's task-group downloader wires concurrent shards' child Progress into
+            // the parent. That may or may not still reproduce on the currently pinned
+            // version, but either way there is no ground truth available from outside the
+            // library that's cheaper than this: use the real Progress as the primary
+            // signal, and if it stops advancing for a few seconds before reaching 100%,
+            // fall back to an indeterminate spinner (unknownDownloadPercent) rather than
+            // showing a specific percentage that has stopped meaning anything -- an honest
+            // "still working" beats a number that looks stuck twice over.
+            let progressBox = DownloadProgressBox()
+            let downloadWatchTask = Task.detached {
+                var bestFraction = 0.0
+                var lastAdvance = ContinuousClock.now
                 while !Task.isCancelled {
-                    guard let self else { return }
-                    let percent = await self.downloadPercent(for: model)
-                    if percent != lastReportedPercent {
-                        lastReportedPercent = percent
-                        let completed = await self.cachedBytes(for: model.repository)
-                        await progress(.init(phase: .downloading(percent), detail: "Downloading native MLX model files", completedBytes: completed, totalBytes: model.downloadBytes))
+                    if let fraction = await progressBox.fractionCompleted {
+                        if fraction > bestFraction { bestFraction = fraction; lastAdvance = .now }
+                        let stalled = lastAdvance.duration(to: .now) > .seconds(5) && bestFraction < 1
+                        if stalled {
+                            // Once the reported fraction has stopped advancing, its last
+                            // value is known-unreliable (see above) -- showing "11.5 MB of
+                            // 5 GB" forever would flatly contradict gigabytes of real
+                            // traffic still landing on disk. Drop the byte counts along
+                            // with the percentage rather than keep asserting a specific,
+                            // now-false number.
+                            await progress(.init(phase: .downloading(unknownDownloadPercent),
+                                                 detail: "Downloading native MLX model files -- large models can take a while"))
+                        } else {
+                            let percent = min(99, max(0, Int(bestFraction * 100)))
+                            await progress(.init(phase: .downloading(percent), detail: "Downloading native MLX model files",
+                                                 completedBytes: Int64(bestFraction * Double(model.downloadBytes)), totalBytes: model.downloadBytes))
+                        }
                     }
-                    try? await Task.sleep(for: .seconds(1))
+                    try? await Task.sleep(for: .milliseconds(500))
                 }
             }
-            defer { downloadPollTask.cancel() }
+            defer { downloadWatchTask.cancel() }
             // Must be the explicit `progressHandler:` label, NOT a trailing closure: mlx-swift-lm's
             // LoadContainerMacro expansion (Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift)
             // finds the closure to splice in by searching the macro call's argument list for a
             // label matching "progressHandler" -- a trailing closure carries no such label in that
             // list, so the macro silently falls back to a no-op `{ _ in }` and any closure passed
-            // that way is never invoked at all. The callback itself is unused now (see above), but
-            // the label still matters for anyone touching this call in future.
+            // that way is never invoked at all.
             let container = try await #huggingFaceLoadModelContainer(
                 configuration: configuration,
-                progressHandler: { _ in }
+                progressHandler: { p in Task { await progressBox.update(p) } }
             )
             try Task.checkCancellation()
             nativeContainer = container
