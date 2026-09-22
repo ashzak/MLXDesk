@@ -306,29 +306,28 @@ final class AppModel {
         Task { await DiagnosticsStore.shared.record(.init(category: "generation", name: "cancelled", modelID: selectedModel.repository)) }
     }
 
-    /// Called from `applicationShouldTerminate` before the app is allowed to quit.
-    /// Cancels any in-flight generation and waits for it to actually unwind, then tears
-    /// the runtime down in an orderly way. This matters because MLX's native generation
-    /// runs on its own detached task, off the structured-concurrency tree `generationTask`
-    /// belongs to: cancelling `generationTask` only asks that task to stop, it doesn't
-    /// block until the underlying `mlx_async_eval` work has actually finished. If the
-    /// process exits (or `service.stop()` releases the Metal device) while that eval is
-    /// still in flight, MLX's scheduler tries to lock a mutex that no longer exists and
-    /// treats that as unrecoverable -- crashing the whole process instead of throwing a
-    /// catchable error (confirmed via a crash log: "MLX/ErrorHandler.swift:345: Fatal
-    /// error: mutex lock failed: Invalid argument", raised ~0.7s after Quit while a
-    /// response was still streaming). Awaiting the cancelled task's `.value` lets that
-    /// step finish naturally before anything gets torn down.
+    /// Called from `applicationShouldTerminate` before the app is allowed to quit. Gives
+    /// any in-flight generation a bounded window to wind down and persists whatever
+    /// response text has streamed in so far, but deliberately does NOT release the native
+    /// MLX session/container itself (an earlier version of this method called
+    /// `service.stop()` here, which is exactly what caused a second, different crash: when
+    /// the wait timed out because MLX's own background compute thread hadn't honored
+    /// cancellation yet, `service.stop()` released the container out from under that still
+    /// -running thread, which then segfaulted inside MLX's compiled-kernel cache
+    /// (`CompilerCache`) on a now-freed object -- confirmed live, reproduced by quitting
+    /// mid-generation). MLX's native generation runs on its own detached task, off the
+    /// structured-concurrency tree `generationTask` belongs to, so cancelling
+    /// `generationTask` only asks that task to stop -- it doesn't guarantee the underlying
+    /// compute has actually finished by the time we give up waiting. Leaving the
+    /// (possibly still in use) native objects alone and simply letting the process exit
+    /// shortly after is safe: see `AppDelegate.applicationWillTerminate`, which is what
+    /// actually closes this race by skipping process teardown entirely rather than trying
+    /// to win it.
     func prepareForTermination() async {
         generationWatchdogTask?.cancel(); generationWatchdogTask = nil
         if let task = generationTask {
             generationTask = nil
             task.cancel()
-            // Race the cancelled task's own unwind against a short timeout, rather than
-            // awaiting task.value unconditionally, so a stuck generation can't hang Quit
-            // forever. `task` (a plain Task<Void, Never>) is captured here instead of
-            // `self`/`model` specifically so this stays a value the region-based isolation
-            // checker can reason about inside the nested addTask closures.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await task.value }
                 group.addTask { try? await Task.sleep(for: .seconds(5)) }
@@ -337,7 +336,7 @@ final class AppModel {
             }
         }
         isGenerating = false
-        await service.stop()
+        conversations.persist()
     }
 
     func completeOnboarding() {
