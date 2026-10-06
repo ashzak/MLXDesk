@@ -7,11 +7,14 @@ import AppKit
 final class AppModel {
     let conversations: ConversationStore
     var preferences: AppPreferences
+    let localModelStore: LocalModelStore
+    let resourceMonitor = ResourceMonitor()
     private let service: MLXService
     private let catalogService = ModelCatalogService()
     private let compatibilityStore: ModelCompatibilityStore
     private let performanceStore: PerformanceStore
     var selectedModel = MLXModel.curated[0]
+    var localModelImportError: String?
     var settings = GenerationSettings()
     var runtime: RuntimeState = .checking
     var runtimePhase: RuntimePhase = .idle
@@ -51,6 +54,9 @@ final class AppModel {
     var loadTotalBytes: Int64?
     var loadStartedAt: Date?
     var resumesAfterWake = false
+    var workspaceURL: URL?
+    var pendingEdits: [PendingEdit] = []
+    var activeToolActivity: String?
     private var generationTask: Task<Void, Never>?
     private var modelLoadTask: Task<Void, Never>?
     private var generationWatchdogTask: Task<Void, Never>?
@@ -62,7 +68,7 @@ final class AppModel {
     private var idleUnloadTask: Task<Void, Never>?
     private var systemConditionTask: Task<Void, Never>?
 
-    init(conversations: ConversationStore? = nil, service: MLXService? = nil, compatibilityStore: ModelCompatibilityStore? = nil, performanceStore: PerformanceStore? = nil, preferences: AppPreferences? = nil, generationStallTimeout: TimeInterval? = nil) {
+    init(conversations: ConversationStore? = nil, service: MLXService? = nil, compatibilityStore: ModelCompatibilityStore? = nil, performanceStore: PerformanceStore? = nil, preferences: AppPreferences? = nil, localModelStore: LocalModelStore? = nil, generationStallTimeout: TimeInterval? = nil) {
         let environment = ProcessInfo.processInfo.environment
         let demo = environment["MLX_DESK_UI_TESTING"] == "1"
         self.conversations = conversations ?? ConversationStore(seed: demo)
@@ -70,6 +76,7 @@ final class AppModel {
         self.compatibilityStore = compatibilityStore ?? ModelCompatibilityStore()
         self.performanceStore = performanceStore ?? PerformanceStore()
         self.preferences = preferences ?? AppPreferences()
+        self.localModelStore = localModelStore ?? LocalModelStore()
         self.generationStallTimeoutOverride = generationStallTimeout
         if environment["MLX_DESK_UI_TESTING_DOWNLOAD"] == "1" { runtime = .downloading(42) }
         else if demo { runtime = .ready }
@@ -77,6 +84,36 @@ final class AppModel {
         configureMemoryPressureMonitoring()
         startSystemConditionMonitoring()
         UpdateController.shared.startWhenConfigured()
+        if !demo { resourceMonitor.start() }
+    }
+
+    var localModels: [MLXModel] { localModelStore.models }
+
+    /// Opens a directory picker, validates the chosen folder looks like a loadable MLX
+    /// model (same `ResourcePreflightValidator` check a downloaded snapshot gets), and
+    /// adds it to the picker. Mirrors `chooseWorkspace()`'s use of a plain NSOpenPanel.
+    func importLocalModel() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Local MLX Model"
+        panel.message = "Choose a folder containing config.json, tokenizer files, and .safetensors weights."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let imported = try MLXModel.local(directory: url)
+            localModelStore.add(imported)
+            selectedModel = imported
+            modelChanged()
+            localModelImportError = nil
+        } catch {
+            localModelImportError = error.localizedDescription
+        }
+    }
+
+    func removeLocalModel(_ model: MLXModel) {
+        localModelStore.remove(model)
+        if selectedModel.id == model.id { selectedModel = MLXModel.curated[0]; modelChanged() }
     }
 
     func checkRuntime() async {
@@ -258,7 +295,11 @@ final class AppModel {
                 var response = ""; var tokenEstimate = 0
                 var firstTokenAt: ContinuousClock.Instant?
                 var lastRender = Date.distantPast
-                for try await chunk in await service.stream(messages: Array(messages), settings: settings) {
+                for try await chunk in await service.stream(
+                    messages: Array(messages), settings: settings, workspaceURL: workspaceURL,
+                    onProposeEdit: { [weak self] edit in await self?.stagePendingEdit(edit) },
+                    onToolActivity: { [weak self] activity in await self?.setToolActivity(activity) }
+                ) {
                     try Task.checkCancellation(); response += chunk; tokenEstimate += 1
                     lastGenerationActivity = .now
                     if firstTokenAt == nil {
@@ -294,12 +335,14 @@ final class AppModel {
                 await DiagnosticsStore.shared.record(.init(category: "generation", name: "failed", modelID: selectedModel.repository, detail: message))
             }
             isGenerating = false
+            activeToolActivity = nil
             generationWatchdogTask?.cancel(); generationWatchdogTask = nil
         }
     }
 
     func stopGeneration() {
         generationTask?.cancel(); generationTask = nil; isGenerating = false
+        activeToolActivity = nil
         generationWatchdogTask?.cancel(); generationWatchdogTask = nil
         runtimePhase = runtime == .running ? .ready : .idle
         conversations.persist()
@@ -385,6 +428,60 @@ final class AppModel {
             parts.append(block)
         }
         return parts.joined(separator: "\n\n")
+    }
+
+    /// Opens an NSOpenPanel scoped to directories, matching the NSSavePanel
+    /// convention already used for diagnostics export (ModelInspector.swift).
+    /// Setting `workspaceURL` is what turns on the read/propose-edit tools for
+    /// the next generation -- see MLXService.stream's tools: parameter.
+    func chooseWorkspace() {
+        let panel = NSOpenPanel()
+        panel.title = "Open Workspace"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        workspaceURL = url
+        pendingEdits.removeAll()
+    }
+
+    func closeWorkspace() {
+        workspaceURL = nil
+        pendingEdits.removeAll()
+    }
+
+    /// Called (via a `@Sendable` closure, hence `@MainActor` hop) from the
+    /// `propose_edit` tool's handler in WorkspaceTools.swift when the model
+    /// proposes a change. Never writes to disk itself.
+    @MainActor
+    func stagePendingEdit(_ edit: PendingEdit) {
+        pendingEdits.append(edit)
+    }
+
+    /// Drives the "using read_file(App.swift)…" transcript indicator -- see
+    /// WorkspaceTools.makeToolSet's onActivity parameter.
+    @MainActor
+    func setToolActivity(_ description: String?) {
+        activeToolActivity = description
+    }
+
+    /// Writes `edit.newContent` to disk, re-validating containment within the
+    /// current workspace even though WorkspaceTools already checked at proposal
+    /// time -- defense in depth against the workspace having changed (or the
+    /// edit being replayed) between proposal and this explicit user action.
+    func applyEdit(_ edit: PendingEdit) {
+        defer { pendingEdits.removeAll { $0.id == edit.id } }
+        guard let workspaceURL else { return }
+        do {
+            let fileURL = try WorkspaceTools.resolve(edit.path, in: workspaceURL)
+            try edit.newContent.write(to: fileURL, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Couldn't apply the edit to \(edit.path): \(error.localizedDescription)"
+        }
+    }
+
+    func rejectEdit(_ edit: PendingEdit) {
+        pendingEdits.removeAll { $0.id == edit.id }
     }
 
     func preferencesChanged() { scheduleIdleUnload() }
@@ -524,8 +621,22 @@ final class AppModel {
     /// cost. Scales with the selected model's own memory footprint instead of a
     /// single constant, floored at the old 45s and capped so a truly-stuck model
     /// still gets caught within a few minutes rather than never.
+    ///
+    /// A 27B local import (see LocalModelStore) was confirmed live to still be
+    /// mid-warmup-compile and killed at the formula's own 180s ceiling below --
+    /// `memoryGB * 6` for a ~17GB-while-running model only reaches ~104s, nowhere
+    /// near that ceiling, so raising the cap alone wouldn't have helped; the
+    /// per-GB multiplier itself is too low at this scale. Rather than re-tune
+    /// that multiplier against a single data point and risk under/over-fitting
+    /// catalog models it already works for, local imports get their own flat,
+    /// generous budget: they're exactly the case (a never-before-run custom
+    /// conversion) where first-compile cost is least likely to already be
+    /// amortized by a warm shader cache, and a user who just hand-picked a
+    /// folder of weights is likely to want more patience before an automatic
+    /// unload, not less.
     private var generationStallTimeout: TimeInterval {
         if let generationStallTimeoutOverride { return generationStallTimeoutOverride }
+        if selectedModel.isLocal { return 240 }
         let memoryGB = Self.parsedGB(from: selectedModel.memory) ?? 8
         return min(180, max(45, memoryGB * 6))
     }

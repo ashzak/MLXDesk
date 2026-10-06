@@ -18,6 +18,11 @@ struct ModelInspector: View {
                     Label("Browse All Compatible MLX Models", systemImage: "square.grid.2x2").frame(maxWidth: .infinity)
                 }
                 .accessibilityIdentifier("catalog.open")
+                Button { model.importLocalModel() } label: {
+                    Label("Add Local Model…", systemImage: "folder.badge.plus").frame(maxWidth: .infinity)
+                }
+                .help("Point MLX Desk at a folder of MLX weights already on disk -- e.g. a custom mlx_lm.convert output -- no download needed")
+                .accessibilityIdentifier("model.addLocal")
                 VStack(alignment: .leading, spacing: 6) {
                     HStack { Text(model.selectedModel.detail).fontWeight(.medium); if model.selectedModel.recommended { Text("Recommended").font(.caption2).padding(4).background(.green.opacity(0.15), in: Capsule()) } }
                     Label(model.selectedModel.bestFor, systemImage: model.selectedModel.bestForIcon)
@@ -83,6 +88,7 @@ struct ModelInspector: View {
                     }.accessibilityIdentifier("settings.context")
                 }
             }
+            Section("Live Resource Usage") { ResourceUsageRows(model: model) }
             Section("Privacy") {
                 Label("Prompts stay on this Mac", systemImage: "lock.shield.fill").foregroundStyle(.secondary)
                 Text("Inference runs locally with native MLX. Model downloads come from Hugging Face.").font(.caption).foregroundStyle(.tertiary)
@@ -101,7 +107,68 @@ struct ModelInspector: View {
     }
 
     private var isDownloading: Bool { if case .downloading = model.runtime { true } else { false } }
-    private var quickModels: [MLXModel] { [model.selectedModel] + MLXModel.curated.filter { $0.id != model.selectedModel.id } }
+    private var quickModels: [MLXModel] {
+        [model.selectedModel] + (model.localModels + MLXModel.curated).filter { $0.id != model.selectedModel.id }
+    }
+}
+
+/// CPU, unified memory, and (while generating) live tokens/sec -- sampled once a
+/// second by `ResourceMonitor` (see ResourceMonitor.swift for why there's no
+/// separate GPU figure on this hardware). Lives in its own view so ModelInspector's
+/// Form body isn't one more screenful longer; reads `model.resourceMonitor.sample`
+/// directly rather than copying it onto AppModel, since nothing outside this row
+/// needs it.
+struct ResourceUsageRows: View {
+    @Bindable var model: AppModel
+    private var sample: ResourceSample { model.resourceMonitor.sample }
+
+    var body: some View {
+        LabeledContent("CPU") {
+            Gauge(value: sample.cpuPercent, in: 0...100) { EmptyView() } currentValueLabel: {
+                Text(sample.cpuPercent, format: .number.precision(.fractionLength(0))).monospacedDigit()
+            }
+            .gaugeStyle(.accessoryLinear).tint(cpuTint)
+        }
+        .accessibilityIdentifier("resources.cpu")
+        LabeledContent("Memory") {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(bytes(sample.systemMemoryUsedBytes)) of \(bytes(sample.systemMemoryTotalBytes))")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                ProgressView(value: memoryFraction).progressViewStyle(.linear).tint(memoryTint).frame(width: 130)
+            }
+        }
+        .accessibilityIdentifier("resources.memory")
+        LabeledContent("This app") {
+            Text(bytes(sample.appMemoryBytes)).monospacedDigit().foregroundStyle(.secondary)
+        }
+        .help("Resident memory for MLX Desk itself -- on Apple Silicon this includes the loaded model's weights and KV cache, since the GPU reads from the same unified memory pool")
+        .accessibilityIdentifier("resources.appMemory")
+        if model.isGenerating || model.tokensPerSecond != nil {
+            LabeledContent("Generation speed") {
+                if model.isGenerating { Text("Generating…").foregroundStyle(.secondary) }
+                else if let tps = model.tokensPerSecond { Text("\(tps, format: .number.precision(.fractionLength(1))) tok/s").monospacedDigit().foregroundStyle(.secondary) }
+            }
+            .accessibilityIdentifier("resources.tokensPerSecond")
+        }
+        if sample.thermalState != .nominal {
+            Label(thermalLabel, systemImage: "thermometer.high").font(.caption).foregroundStyle(.orange)
+        }
+    }
+
+    private var memoryFraction: Double {
+        guard sample.systemMemoryTotalBytes > 0 else { return 0 }
+        return Double(sample.systemMemoryUsedBytes) / Double(sample.systemMemoryTotalBytes)
+    }
+    private var cpuTint: Color { sample.cpuPercent > 85 ? .orange : .accentColor }
+    private var memoryTint: Color { memoryFraction > 0.85 ? .orange : .accentColor }
+    private var thermalLabel: String {
+        switch sample.thermalState {
+        case .serious: "This Mac is under thermal pressure"
+        case .critical: "This Mac is critically overheated"
+        default: "Elevated thermal state"
+        }
+    }
+    private func bytes(_ value: UInt64) -> String { ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .memory) }
 }
 
 struct RuntimeDiagnosticsView: View {

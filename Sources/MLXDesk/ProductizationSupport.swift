@@ -71,6 +71,39 @@ final class AppPreferences {
     }
 }
 
+/// Models imported from a local folder (see `MLXModel.local(directory:)`), persisted
+/// across launches the same way everything else here is -- flat UserDefaults, no
+/// migration story needed since this is a small, user-curated list.
+@MainActor @Observable
+final class LocalModelStore {
+    private let defaults: UserDefaults
+    private let key = "localModels"
+    var models: [MLXModel] {
+        didSet {
+            guard let data = try? JSONEncoder().encode(models) else { return }
+            defaults.set(data, forKey: key)
+        }
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let data = defaults.data(forKey: key), let saved = try? JSONDecoder().decode([MLXModel].self, from: data) {
+            models = saved
+        } else {
+            models = []
+        }
+    }
+
+    func add(_ model: MLXModel) {
+        models.removeAll { $0.repository == model.repository }
+        models.insert(model, at: 0)
+    }
+
+    func remove(_ model: MLXModel) {
+        models.removeAll { $0.repository == model.repository }
+    }
+}
+
 @MainActor
 final class UpdateController {
     static let shared = UpdateController()

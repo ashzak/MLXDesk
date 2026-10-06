@@ -51,7 +51,8 @@ actor MLXService {
     }
 
     func modelIsDownloaded(_ model: MLXModel) -> Bool {
-        localSnapshot(for: model.repository) != nil
+        if model.isLocal { return true }
+        return localSnapshot(for: model.repository) != nil
     }
 
     func cachedRevision(for repository: String) -> String? {
@@ -92,6 +93,16 @@ actor MLXService {
         #if !arch(arm64)
         throw PreflightError.unsupportedProcessor
         #endif
+        if let directory = model.localDirectoryURL {
+            try ResourcePreflightValidator.validateSnapshot(at: directory)
+            let physical = ProcessInfo.processInfo.physicalMemory
+            var warnings: [String] = []
+            if let estimated = estimatedMemoryBytes(model), UInt64(estimated) > physical * 8 / 10 {
+                warnings.append("This model may use more than 80% of physical memory.")
+            }
+            return PreflightReport(modelID: model.repository, availableDiskBytes: 0, requiredDiskBytes: 0,
+                                   physicalMemoryBytes: physical, modelAlreadyDownloaded: true, warnings: warnings)
+        }
         let downloaded = modelIsDownloaded(model)
         if downloaded { try validateCachedSnapshot(for: model.repository) }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -145,7 +156,14 @@ actor MLXService {
         }
         if usesNativeRuntime {
             await progress(.init(phase: .launching, detail: "Preparing the native MLX engine"))
-            let configuration = ModelConfiguration(id: model.repository)
+            // A local import has no remote id to resolve -- `.directory` tells
+            // ModelConfiguration's resolver (mlx-swift-lm/ModelFactory.resolve) to read
+            // weights straight from this path, with no Downloader/HubClient involved at
+            // all. Same `#huggingFaceLoadModelContainer` call below handles both cases;
+            // it switches on `configuration.id` internally. `loadableDirectory` may
+            // return a shim directory rather than `model.localDirectoryURL` itself --
+            // see its doc comment.
+            let configuration = try model.localDirectoryURL.map { ModelConfiguration(directory: try loadableDirectory(for: $0)) } ?? ModelConfiguration(id: model.repository)
             // An earlier version of this method polled the Hugging Face cache's blobs
             // directory instead of trusting swift-huggingface's own Progress (see below for
             // why that callback was distrusted). That polling approach is fundamentally
@@ -242,7 +260,7 @@ actor MLXService {
         await progress(.init(phase: .launching, detail: "Starting the local MLX runtime"))
         guard let server = executable(named: "mlx_lm.server") else { throw ServiceError.installFailed }
         let task = Process(); task.executableURL = server
-        task.arguments = ["--model", localSnapshot(for: model.repository)?.path ?? model.repository, "--port", String(port)]
+        task.arguments = ["--model", model.localDirectoryPath ?? localSnapshot(for: model.repository)?.path ?? model.repository, "--port", String(port)]
         let logs = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appending(path: "MLXDesk/mlx-server.log")
         try FileManager.default.createDirectory(at: logs.deletingLastPathComponent(), withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: logs.path, contents: nil)
@@ -273,7 +291,11 @@ actor MLXService {
         nativeSession = nil; nativeContainer = nil
     }
 
-    func stream(messages: [ChatMessage], settings: GenerationSettings) -> AsyncThrowingStream<String, Error> {
+    func stream(
+        messages: [ChatMessage], settings: GenerationSettings, workspaceURL: URL? = nil,
+        onProposeEdit: @escaping @Sendable (PendingEdit) async -> Void = { _ in },
+        onToolActivity: @escaping @Sendable (String?) async -> Void = { _ in }
+    ) -> AsyncThrowingStream<String, Error> {
         if isDemo {
             return AsyncThrowingStream { continuation in
                 let task = Task {
@@ -302,10 +324,23 @@ actor MLXService {
                 return AsyncThrowingStream { $0.finish(throwing: ServiceError.badResponse) }
             }
             let transcript = messages.map { "\($0.role.rawValue.capitalized): \($0.content)" }.joined(separator: "\n\n")
+            // Workspace tools are only registered when a folder is open: with no
+            // workspaceURL, tools/toolDispatch stay nil and this is byte-for-byte
+            // the same ChatSession construction as before workspace support existed
+            // -- zero behavior change for plain chat use.
+            var toolSet: [ToolSpec]?
+            var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
+            if let workspaceURL {
+                let built = WorkspaceTools.makeToolSet(root: workspaceURL, onPropose: onProposeEdit, onActivity: onToolActivity)
+                toolSet = built.tools
+                toolDispatch = built.dispatch
+            }
             let session = ChatSession(
                 nativeContainer,
                 instructions: settings.systemPrompt,
-                generateParameters: .init(maxTokens: settings.maxTokens, temperature: Float(settings.temperature))
+                generateParameters: .init(maxTokens: settings.maxTokens, temperature: Float(settings.temperature)),
+                tools: toolSet,
+                toolDispatch: toolDispatch
             )
             nativeSession = session
             let sessionBox = NativeSessionBox(session)
@@ -472,6 +507,61 @@ actor MLXService {
         let snapshot = root.appending(path: "snapshots/\(revision)")
         guard !hasIncompleteFiles(for: repository), ResourcePreflightValidator.isComplete(at: snapshot) else { return nil }
         return snapshot
+    }
+
+    /// swift-transformers' tokenizer loader (vendored at
+    /// .build/checkouts/swift-transformers/Sources/Tokenizers/Tokenizer.swift,
+    /// `TokenizerModel.knownTokenizers`) only recognizes a fixed, hardcoded list of
+    /// `tokenizer_class` values and -- called with its default `strict: true` by the
+    /// `#huggingFaceLoadModelContainer` macro this app uses -- throws
+    /// `unsupportedTokenizer` for anything outside it, rather than falling back to
+    /// plain BPE the way it would under `strict: false`. A freshly-converted model
+    /// can easily carry a `tokenizer_class` newer than this pinned dependency knows
+    /// about (confirmed live: "Qwen3_5Tokenizer" from an `mlx_lm.convert` output,
+    /// rejected even though it's the exact same BPE format as the already-recognized
+    /// "Qwen2Tokenizer" one line above it in that table) -- the underlying
+    /// tokenizer.json vocab/merges are unaffected by the class name either way.
+    ///
+    /// Patching the vendored checkout directly was ruled out: `swift package
+    /// update`/a clean resolve would silently discard it. Instead, for an
+    /// unrecognized class, this builds (or reuses) a same-named sibling directory
+    /// under Application Support that symlinks every file from the original model
+    /// folder except tokenizer_config.json, which gets a byte-identical copy with
+    /// only `tokenizer_class` rewritten to "PreTrainedTokenizer" -- a name the table
+    /// does map to BPETokenizer, i.e. exactly the fallback `strict: false` would have
+    /// chosen anyway. The user's own folder is never written to. Returns the
+    /// original directory unchanged (no shim, no filesystem writes at all) whenever
+    /// the class is already recognized, which is the common case for anything
+    /// downloaded from mlx-community.
+    private func loadableDirectory(for original: URL) throws -> URL {
+        let configURL = original.appending(path: "tokenizer_config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokenizerClass = parsed["tokenizer_class"] as? String else { return original }
+        let knownTokenizerClasses: Set<String> = [
+            "BertTokenizer", "CodeGenTokenizer", "CodeLlamaTokenizer", "CohereTokenizer",
+            "DistilbertTokenizer", "DistilBertTokenizer", "FalconTokenizer", "GemmaTokenizer",
+            "GPT2Tokenizer", "LlamaTokenizer", "RobertaTokenizer", "T5Tokenizer",
+            "TokenizersBackend", "PreTrainedTokenizer", "Qwen2Tokenizer", "WhisperTokenizer",
+            "XLMRobertaTokenizer", "Xlm-RobertaTokenizer",
+        ]
+        guard !knownTokenizerClasses.contains(tokenizerClass.replacingOccurrences(of: "Fast", with: "")) else { return original }
+
+        let manager = FileManager.default
+        let sanitizedName = original.path.replacingOccurrences(of: "/", with: "_")
+        let shimDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "MLXDesk/LocalModelShims/\(sanitizedName)")
+        try? manager.removeItem(at: shimDirectory)
+        try manager.createDirectory(at: shimDirectory, withIntermediateDirectories: true)
+        for file in (try? manager.contentsOfDirectory(at: original, includingPropertiesForKeys: nil)) ?? [] {
+            guard file.lastPathComponent != "tokenizer_config.json" else { continue }
+            try? manager.createSymbolicLink(at: shimDirectory.appending(path: file.lastPathComponent), withDestinationURL: file)
+        }
+        var patched = parsed
+        patched["tokenizer_class"] = "PreTrainedTokenizer"
+        let patchedData = try JSONSerialization.data(withJSONObject: patched, options: [.prettyPrinted])
+        try patchedData.write(to: shimDirectory.appending(path: "tokenizer_config.json"))
+        return shimDirectory
     }
 
     private func validateCachedSnapshot(for repository: String) throws {

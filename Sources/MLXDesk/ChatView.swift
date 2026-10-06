@@ -26,7 +26,7 @@ struct ChatView: View {
                                     )
                                     .id(message.id)
                                 }
-                                if model.isGenerating { ThinkingIndicator(modelName: model.selectedModel.displayName).id("thinking") }
+                                if model.isGenerating { ThinkingIndicator(modelName: model.selectedModel.displayName, activity: model.activeToolActivity).id("thinking") }
                                 Color.clear.frame(height: 1).id("bottomAnchor")
                                     .onAppear { pinnedToBottom = true }
                                     .onDisappear { pinnedToBottom = false }
@@ -303,6 +303,60 @@ private struct CodeBlockView: View {
             .help("Copy code")
             .accessibilityLabel("Copy code")
         }
+    }
+}
+
+/// Reviews file edits the model proposed via the `propose_edit` workspace tool
+/// (see WorkspaceTools.swift, AppModel.pendingEdits) -- nothing has touched
+/// disk yet; Apply/Reject here is the only thing that can. One card per
+/// pending edit so multiple proposals in flight are all visible at once.
+struct WorkspaceEditReviewView: View {
+    @Bindable var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    ForEach(model.pendingEdits) { edit in
+                        EditReviewCard(edit: edit, onApply: { model.applyEdit(edit) }, onReject: { model.rejectEdit(edit) })
+                    }
+                }
+                .padding(20)
+            }
+            .navigationTitle("Review Proposed Edits")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+        }
+        .frame(minWidth: 560, minHeight: 420)
+    }
+}
+
+private struct EditReviewCard: View {
+    let edit: PendingEdit
+    let onApply: () -> Void
+    let onReject: () -> Void
+    @State private var showOriginal = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(edit.path).font(.headline).textSelection(.enabled)
+            if !edit.oldContent.isEmpty {
+                DisclosureGroup("Current contents", isExpanded: $showOriginal) {
+                    CodeBlockView(language: nil, code: edit.oldContent)
+                }
+                .font(.caption)
+            }
+            Text("Proposed contents").font(.caption).foregroundStyle(.secondary)
+            CodeBlockView(language: nil, code: edit.newContent)
+            HStack {
+                Button("Reject", role: .destructive, action: onReject).accessibilityIdentifier("edit.reject.\(edit.id)")
+                Spacer()
+                Button("Apply", action: onApply).buttonStyle(.borderedProminent).accessibilityIdentifier("edit.apply.\(edit.id)")
+            }
+        }
+        .padding(14)
+        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
     }
 }
 
@@ -588,10 +642,19 @@ struct EmptyChatView: View {
 
 struct ThinkingIndicator: View {
     let modelName: String
+    /// The workspace tool currently in flight (e.g. "read_file(App.swift)"),
+    /// set via AppModel.activeToolActivity while a tool call is running --
+    /// see WorkspaceTools.makeToolSet's onActivity parameter. Falls back to
+    /// the generic label when nil (no workspace open, or between tool calls).
+    var activity: String? = nil
     @State private var pulse = false
     var body: some View {
-        HStack { ProgressView().controlSize(.small); Text("\(modelName) is working…").foregroundStyle(.secondary); Spacer() }
-            .padding(.horizontal, 40).opacity(pulse ? 0.65 : 1).onAppear { withAnimation(.easeInOut(duration: 0.8).repeatForever()) { pulse = true } }
-            .accessibilityLabel("\(modelName) is generating a response")
+        HStack {
+            ProgressView().controlSize(.small)
+            Text(activity.map { "Using \($0)…" } ?? "\(modelName) is working…").foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 40).opacity(pulse ? 0.65 : 1).onAppear { withAnimation(.easeInOut(duration: 0.8).repeatForever()) { pulse = true } }
+        .accessibilityLabel(activity.map { "Using tool \($0)" } ?? "\(modelName) is generating a response")
     }
 }

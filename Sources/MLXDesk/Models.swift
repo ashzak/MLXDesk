@@ -45,6 +45,14 @@ struct MLXModel: Identifiable, Codable, Hashable, Sendable {
     /// known from the catalog. Download-percent math must not trust it as a
     /// denominator -- doing so makes a still-incomplete resume read as ~100% done.
     var downloadSizeIsEstimated: Bool = false
+    /// Set only for models imported from a folder on disk (see `LocalModelStore`).
+    /// When present, this is authoritative over `repository`-based Hugging Face
+    /// cache/download logic everywhere in MLXService -- there is no remote source
+    /// to check or fetch, the weights are already sitting at this path.
+    var localDirectoryPath: String? = nil
+
+    var isLocal: Bool { localDirectoryPath != nil }
+    var localDirectoryURL: URL? { localDirectoryPath.map { URL(fileURLWithPath: $0) } }
 
     var bestFor: String {
         let name = "\(repository) \(displayName)".lowercased()
@@ -79,7 +87,41 @@ struct MLXModel: Identifiable, Codable, Hashable, Sendable {
     }
 
     var trustLevel: ModelTrustLevel {
-        repository.lowercased().hasPrefix("mlx-community/") ? .verifiedConversion : .community
+        if isLocal { return .localImport }
+        return repository.lowercased().hasPrefix("mlx-community/") ? .verifiedConversion : .community
+    }
+
+    /// Builds an `MLXModel` entry for a folder of MLX weights already on disk (e.g.
+    /// produced by `mlx_lm.convert`), after validating it looks loadable. The
+    /// `repository` is a synthetic, stable id (`local/<folder name>`) used only as a
+    /// dictionary key for compatibility/quarantine tracking and the model picker --
+    /// MLXService never treats it as a Hugging Face id because `localDirectoryPath`
+    /// takes priority everywhere that matters (see MLXService.start).
+    static func local(directory: URL) throws -> MLXModel {
+        try ResourcePreflightValidator.validateSnapshot(at: directory)
+        let name = directory.lastPathComponent
+        let bytes = Self.directorySize(directory)
+        let gb = Double(bytes) / 1_000_000_000
+        return MLXModel(
+            repository: "local/\(name)",
+            displayName: name,
+            detail: "Imported from \(directory.path)",
+            size: String(format: "~%.1f GB", gb),
+            // Unified memory while running a local weight file tends to run somewhat
+            // above the on-disk size (activations, KV cache) -- 1.15x is a rough same
+            // margin as `FitModel.appModel` uses between its reported size and memory.
+            memory: String(format: "~%.1f GB", gb * 1.15),
+            downloadBytes: bytes, recommended: false,
+            localDirectoryPath: directory.path
+        )
+    }
+
+    private static func directorySize(_ url: URL) -> Int64 {
+        guard let files = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) else { return 0 }
+        return files.reduce(into: Int64(0)) { total, item in
+            guard let fileURL = item as? URL else { return }
+            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
     }
 
     static let curated: [MLXModel] = [
@@ -92,8 +134,9 @@ struct MLXModel: Identifiable, Codable, Hashable, Sendable {
 enum ModelTrustLevel: String, Codable, Sendable {
     case verifiedConversion = "Verified conversion"
     case community = "Community — unverified"
+    case localImport = "Local import"
 
-    var isTrusted: Bool { self == .verifiedConversion }
+    var isTrusted: Bool { self == .verifiedConversion || self == .localImport }
 }
 
 struct LLMFitResponse: Decodable, Sendable {

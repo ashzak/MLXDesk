@@ -25,11 +25,34 @@ struct ModelCatalogView: View {
             Group {
                 if model.catalogLoading && model.catalogModels.isEmpty {
                     ContentUnavailableView { ProgressView(); Text("Analyzing this Mac") } description: { Text("llmfit is measuring memory, GPU, and MLX compatibility.") }
-                } else if results.isEmpty {
+                } else if results.isEmpty && model.localModels.isEmpty {
                     ContentUnavailableView.search(text: search)
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
+                            if !model.localModels.isEmpty {
+                                Section {
+                                    ForEach(model.localModels) { item in
+                                        ModelCatalogRow(item: item, selected: item.id == model.selectedModel.id) {
+                                            model.selectedModel = item
+                                            model.modelChanged()
+                                            dismiss()
+                                        }
+                                        .contextMenu {
+                                            Button("Remove", role: .destructive) { model.removeLocalModel(item) }
+                                        }
+                                        Divider()
+                                    }
+                                } header: {
+                                    HStack {
+                                        Text("Local Models").font(.headline)
+                                        Spacer()
+                                        Button { model.importLocalModel() } label: { Label("Add…", systemImage: "folder.badge.plus") }
+                                            .buttonStyle(.borderless).accessibilityIdentifier("catalog.addLocal")
+                                    }
+                                    .padding(.top, 12).padding(.bottom, 4)
+                                }
+                            }
                             ForEach(results) { item in
                                 ModelCatalogRow(item: item, selected: item.id == model.selectedModel.id) {
                                     model.selectedModel = item
