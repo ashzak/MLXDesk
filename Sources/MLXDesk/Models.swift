@@ -212,6 +212,15 @@ struct GenerationSettings: Codable, Equatable, Sendable {
     var maxTokens = 2048
     var contextLength = 32768
     var systemPrompt = "You are an expert coding assistant. Be concise, explain tradeoffs, and return complete code when asked."
+    /// Threaded through to the chat template as `enable_thinking` (see
+    /// MLXService.stream's ChatSession `additionalContext:`). Qwen3-family
+    /// templates check this exact key: `false` pre-fills an empty
+    /// `<think>\n\n</think>\n\n` block, skipping the reasoning phase outright
+    /// rather than just asking the model to be brief in its system prompt --
+    /// the latter does nothing here because the template, not the model's own
+    /// judgment, decides whether a `<think>` block opens at all. Models whose
+    /// template doesn't define `enable_thinking` just ignore the extra key.
+    var thinkingEnabled = true
 }
 
 /// A download percent of `unknownDownloadPercent` means the total size behind it is

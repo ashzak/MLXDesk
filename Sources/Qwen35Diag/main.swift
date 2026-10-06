@@ -38,10 +38,12 @@ Task {
         }
         print("[DIAG] Model loaded in \(clock.now - loadStart)")
 
+        let noThink = arguments.count >= 4 && arguments[3] == "--no-think"
         let session = ChatSession(
             container,
             instructions: "You are a helpful assistant.",
-            generateParameters: .init(maxTokens: 64, temperature: 0.2)
+            generateParameters: .init(maxTokens: 64, temperature: 0.2),
+            additionalContext: noThink ? ["enable_thinking": false] : nil
         )
 
         print("[DIAG] Sending prompt: \(prompt)")

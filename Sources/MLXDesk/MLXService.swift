@@ -339,6 +339,11 @@ actor MLXService {
                 nativeContainer,
                 instructions: settings.systemPrompt,
                 generateParameters: .init(maxTokens: settings.maxTokens, temperature: Float(settings.temperature)),
+                // Only set when disabled: omitting the key entirely for the
+                // enabled case keeps this a no-op for every template that
+                // doesn't define `enable_thinking` at all, rather than handing
+                // it a key it has to know to ignore.
+                additionalContext: settings.thinkingEnabled ? nil : ["enable_thinking": false],
                 tools: toolSet,
                 toolDispatch: toolDispatch
             )

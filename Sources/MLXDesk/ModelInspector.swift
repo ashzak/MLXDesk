@@ -80,6 +80,9 @@ struct ModelInspector: View {
                     Slider(value: $model.settings.temperature, in: 0...1, step: 0.1).frame(width: 120).accessibilityIdentifier("settings.temperature")
                     Text(model.settings.temperature, format: .number.precision(.fractionLength(1))).monospacedDigit().frame(width: 28)
                 }
+                Toggle("Thinking", isOn: $model.settings.thinkingEnabled)
+                    .help("Reasoning (\"thinking\") models show their chain of thought before answering, which can run long. Turning this off skips straight to the answer -- has no effect on models whose chat template doesn't support it.")
+                    .accessibilityIdentifier("settings.thinking")
                 DisclosureGroup("Advanced", isExpanded: $advanced) {
                     Stepper("Maximum tokens: \(model.settings.maxTokens)", value: $model.settings.maxTokens, in: 256...8192, step: 256)
                         .accessibilityIdentifier("settings.maxTokens")
