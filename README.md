@@ -2,7 +2,13 @@
 
 A native macOS SwiftUI client for running compatible language models privately with MLX on Apple silicon.
 
-## Run
+## Download
+
+Grab the latest build from [Releases](https://github.com/ashzak/MLXDesk/releases/latest) (`.dmg` or `.zip`), then drag **MLX Desk.app** into `/Applications`.
+
+The app is ad-hoc signed, not notarized, so Gatekeeper will block a plain double-click on first launch. Instead, right-click (or Control-click) the app and choose **Open**, or allow it under **System Settings → Privacy & Security** after the first blocked attempt. Requires macOS 14+ on Apple silicon.
+
+## Run from source
 
 ```sh
 swift run
