@@ -16,7 +16,7 @@ struct ModelCatalogView: View {
         model.catalogModels.filter { item in
             (showCommunityModels || item.trustLevel.isTrusted) &&
             (fit == .all || item.fitLevel?.lowercased() == fit.rawValue.lowercased()) &&
-            (search.isEmpty || item.repository.localizedCaseInsensitiveContains(search))
+            (search.isEmpty || item.repository.localizedCaseInsensitiveContains(search) || item.displayName.localizedCaseInsensitiveContains(search))
         }
     }
 
@@ -68,10 +68,28 @@ struct ModelCatalogView: View {
                 }
             }
             .navigationTitle("MLX Models for This Mac")
-            .searchable(text: $search, prompt: "Search \(model.catalogModels.count) compatible models")
             .safeAreaInset(edge: .top) {
-                if let hardware = model.catalogHardware {
-                    HardwareSummary(hardware: hardware, updatedAt: model.catalogUpdatedAt, engineVersion: model.catalogEngineVersion)
+                VStack(spacing: 0) {
+                    // `.searchable` sits in the sheet's toolbar, same as the other items the
+                    // comment below documents as silently never drawn on this SwiftUI/macOS
+                    // combination -- so the search field is built explicitly here instead,
+                    // where it's guaranteed to render.
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        TextField("Search \(model.catalogModels.count) compatible models", text: $search)
+                            .textFieldStyle(.plain)
+                            .accessibilityIdentifier("catalog.search")
+                        if !search.isEmpty {
+                            Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.plain).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+                    if let hardware = model.catalogHardware {
+                        HardwareSummary(hardware: hardware, updatedAt: model.catalogUpdatedAt, engineVersion: model.catalogEngineVersion)
+                    }
                 }
             }
             .toolbar {
