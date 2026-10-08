@@ -4,7 +4,7 @@
 // same load + ChatSession.streamResponse path the app uses, from the command line, so it
 // can be run and timed directly without any screen automation.
 //
-// Usage: Qwen35Diag <path-to-local-model-directory> ["prompt text"]
+// Usage: Qwen35Diag <path-to-local-model-directory> ["prompt text"] [--no-think] ["system prompt"]
 
 import Foundation
 import HuggingFace
@@ -39,10 +39,12 @@ Task {
         print("[DIAG] Model loaded in \(clock.now - loadStart)")
 
         let noThink = arguments.count >= 4 && arguments[3] == "--no-think"
+        let systemPrompt = arguments.count >= 5 ? arguments[4] : "You are a helpful assistant."
+        print("[DIAG] System prompt: \(systemPrompt)")
         let session = ChatSession(
             container,
-            instructions: "You are a helpful assistant.",
-            generateParameters: .init(maxTokens: 64, temperature: 0.2),
+            instructions: systemPrompt,
+            generateParameters: .init(maxTokens: 300, temperature: 0.7),
             additionalContext: noThink ? ["enable_thinking": false] : nil
         )
 
