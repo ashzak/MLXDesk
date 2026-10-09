@@ -19,10 +19,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select latest Xcode
+      - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          # "latest-stable" resolves to the runner's marked default (16.4, Swift
+          # tools 6.2.4) rather than the newest Xcode actually installed on the
+          # image -- mlx-swift 0.32.3 needs Swift tools 6.3.0, so pin explicitly
+          # to the newest preinstalled Xcode instead.
+          xcode-version: "26.3"
 
       - name: Cache SwiftPM dependencies
         uses: actions/cache@v4
@@ -36,4 +40,8 @@ jobs:
         run: swift build --build-tests
 
       - name: Test
-        run: swift test
+        # swift-testing runs @Test funcs concurrently by default regardless of this
+        # being a single SwiftPM invocation; several tests assert on wall-clock
+        # timing windows that CPU contention from concurrent tests can blow past.
+        # --no-parallel serializes execution so those windows are reliable.
+        run: swift test --no-parallel
