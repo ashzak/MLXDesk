@@ -147,6 +147,8 @@ actor MLXService {
         if injectedFault == .startFailure { throw ServiceError.faultInjected("Model launch failed during a reliability test.") }
         _ = try preflight(model: model)
         if isDemo {
+            await progress(.init(phase: .launching, detail: "Preparing the demo runtime"))
+            try await Task.sleep(for: .milliseconds(150))
             await progress(.init(phase: .downloading(42), detail: "Downloading model files", completedBytes: model.downloadBytes * 42 / 100, totalBytes: model.downloadBytes))
             try await Task.sleep(for: .milliseconds(250))
             await progress(.init(phase: .verifying, detail: "Verifying cached files"))
