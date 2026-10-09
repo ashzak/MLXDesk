@@ -2,6 +2,19 @@ import Foundation
 import Testing
 @testable import MLXDesk
 
+/// Polls `condition` instead of sleeping a fixed duration: returns as soon as it's true,
+/// rather than gambling a single fixed sleep is long enough on whatever machine runs this
+/// (demo-mode generation legitimately takes longer under a cold, loaded CI runner than on
+/// an idle local Mac -- a fixed sleep either wastes time or, if too short, flakes).
+@MainActor
+func waitUntil(timeout: Duration = .seconds(5), _ condition: () -> Bool) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if condition() { return }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}
+
 @MainActor
 struct ConversationStoreTests {
     @Test func createsInitialConversation() {
@@ -68,7 +81,7 @@ struct AppModelTests {
         await model.checkRuntime(); #expect(model.runtime == .ready)
         await model.startModel(); #expect(model.runtime == .running)
         model.draft = "Write a greeting"; model.send()
-        try await Task.sleep(for: .seconds(2))
+        try await waitUntil { !model.isGenerating }
         #expect(model.conversations.selected?.messages.count == 2)
         #expect(model.conversations.selected?.messages.last?.content.contains("swift") == true)
         #expect(model.isGenerating == false)
@@ -103,7 +116,7 @@ struct AppModelTests {
         await model.startModel()
         model.draft = "Trigger a controlled failure"
         model.send()
-        try await Task.sleep(for: .seconds(2))
+        try await waitUntil { !model.isGenerating }
         #expect(model.isGenerating == false)
         if case .failed = model.runtime {} else { Issue.record("Expected a failed runtime") }
         #expect(model.runtimePhase == .failed)
@@ -132,7 +145,7 @@ struct AppModelTests {
         let service = MLXService(isDemo: true, injectedFault: .streamStall)
         let model = AppModel(conversations: ConversationStore(fileURL: nil), service: service, generationStallTimeout: 0.2)
         await model.startModel(); model.draft = "stall"; model.send()
-        try await Task.sleep(for: .milliseconds(700))
+        try await waitUntil { model.runtimePhase == .failed }
         #expect(!model.isGenerating)
         #expect(model.runtimePhase == .failed)
         #expect(model.errorMessage?.contains("stopped producing output") == true)
