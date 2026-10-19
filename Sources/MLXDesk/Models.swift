@@ -127,7 +127,9 @@ struct MLXModel: Identifiable, Codable, Hashable, Sendable {
     static let curated: [MLXModel] = [
         .init(repository: "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit", displayName: "Qwen3 Coder 30B", detail: "Best balance for this M1 Max", size: "~19 GB", memory: "~22 GB", downloadBytes: 19_000_000_000, recommended: true),
         .init(repository: "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit", displayName: "Qwen2.5 Coder 14B", detail: "Faster, with more room for other apps", size: "~9 GB", memory: "~12 GB", downloadBytes: 9_000_000_000, recommended: false),
-        .init(repository: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", displayName: "Qwen2.5 Coder 7B", detail: "Fastest for quick edits", size: "~5 GB", memory: "~8 GB", downloadBytes: 5_000_000_000, recommended: false)
+        .init(repository: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", displayName: "Qwen2.5 Coder 7B", detail: "Fastest for quick edits", size: "~5 GB", memory: "~8 GB", downloadBytes: 5_000_000_000, recommended: false),
+        .init(repository: "mlx-community/Josiefied-Qwen3-8B-abliterated-v1-4bit", displayName: "Josiefied Qwen3 8B (abliterated)", detail: "Refusal-direction ablated -- far fewer built-in refusals", size: "~5.7 GB", memory: "~9 GB", downloadBytes: 5_700_000_000, recommended: false),
+        .init(repository: "mlx-community/Josiefied-Qwen3-4B-abliterated-v1-4bit", displayName: "Josiefied Qwen3 4B (abliterated)", detail: "Lighter abliterated build, same tuning as the 8B", size: "~2.8 GB", memory: "~4.5 GB", downloadBytes: 2_800_000_000, recommended: false)
     ]
 }
 
